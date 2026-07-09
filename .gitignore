@@ -41,5 +41,12 @@ htmlcov/
 # Streamlit
 .streamlit/secrets.toml
 
+# Secrets
+.env
+.env.local
+
 # Jupyter
 .ipynb_checkpoints/
+
+# ML models
+models/

@@ -27,8 +27,12 @@ black-scholes-platform/
 │   └── scenario_analysis.py  # Sensitivity & scenarios
 ├── ui/
 │   └── app.py                # Streamlit dashboard
-├── tests/                    # Unit test suite
+├── ml/
+│   ├── features.py           # Technical feature engineering
+│   ├── xgboost_model.py      # XGBoost return predictor
+│   └── backtest.py           # Walk-forward backtesting
 ├── data/
+│   ├── market_data.py        # Alpaca API market data layer
 │   └── sample_prices.csv     # Sample price data
 ├── requirements.txt
 └── pyproject.toml
@@ -77,6 +81,66 @@ greeks = GreeksCalculator.compute(
 )
 print(greeks.delta, greeks.gamma)
 ```
+
+## Market Data (Alpaca)
+
+Configure API credentials:
+
+```bash
+cp .env.example .env
+# Edit .env with your Alpaca API keys from https://alpaca.markets
+```
+
+```python
+from data.market_data import AlpacaMarketData
+from src.black_scholes import BlackScholesModel
+
+client = AlpacaMarketData.from_env()
+
+# Historical OHLCV bars
+history = client.get_historical_prices("AAPL", start="2024-01-01")
+
+# Live spot price
+spot = client.get_current_price("AAPL")
+
+# Options chain
+chain = client.get_options_chain("AAPL")
+
+# Bridge to Black-Scholes engine
+bs_inputs = client.prepare_black_scholes_inputs("AAPL", chain.iloc[0], risk_free_rate=0.05)
+params = bs_inputs["option_params"]
+price = BlackScholesModel.price(
+    params.spot, params.strike, params.time_to_expiry,
+    params.risk_free_rate, params.volatility,
+    bs_inputs["option_type"], params.dividend_yield,
+)
+```
+
+The Streamlit dashboard includes an **Alpaca Market Data** panel to fetch prices, chains, and price selected contracts directly.
+
+## Machine Learning (XGBoost Return Prediction)
+
+```python
+from data.market_data import AlpacaMarketData
+from ml import ReturnPredictor, WalkForwardBacktester
+
+# Fetch OHLCV from Alpaca
+md = AlpacaMarketData.from_env()
+ohlcv = md.get_historical_prices("AAPL", start="2023-01-01")
+
+# Train XGBoost return predictor
+predictor = ReturnPredictor()
+result = predictor.train(ohlcv)
+print(result.metrics.to_dict())          # RMSE, MAE, directional accuracy
+print(result.feature_importance.head())  # Feature importance
+
+# Walk-forward backtest
+bt = WalkForwardBacktester()
+backtest = bt.run(ohlcv)
+print(backtest.summary())
+```
+
+**macOS note:** XGBoost requires OpenMP: `brew install libomp`
 
 ## Running Tests
 

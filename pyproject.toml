@@ -27,6 +27,11 @@ dependencies = [
   "pandas>=2.0.0",
   "plotly>=5.18.0",
   "streamlit>=1.30.0",
+  "alpaca-py>=0.28.0",
+  "python-dotenv>=1.0.0",
+  "xgboost>=2.0.0",
+  "scikit-learn>=1.3.0",
+  "joblib>=1.3.0",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +39,7 @@ dev = ["pytest>=7.4.0"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["src*", "data*", "ml*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -28,6 +28,35 @@ from src.monte_carlo import MonteCarloPricer
 from src.scenario_analysis import ScenarioEngine
 from src.volatility import VolatilityCalculator
 
+try:
+  from data.market_data import (
+    AlpacaMarketData,
+    AuthenticationError,
+    MarketDataError,
+  )
+  MARKET_DATA_AVAILABLE = True
+except ImportError:
+  MARKET_DATA_AVAILABLE = False
+
+try:
+  from ml import ReturnPredictor, WalkForwardBacktester, XGBoostConfig
+  from ml.features import FeatureEngineer
+
+  def _xgboost_available() -> bool:
+    try:
+      from xgboost import XGBRegressor  # noqa: F401
+      return True
+    except Exception:
+      return False
+
+  ML_AVAILABLE = _xgboost_available()
+  ML_IMPORT_ERROR = None if ML_AVAILABLE else (
+    "XGBoost could not be loaded. On macOS run: brew install libomp"
+  )
+except ImportError as exc:
+  ML_AVAILABLE = False
+  ML_IMPORT_ERROR = str(exc)
+
 # ---------------------------------------------------------------------------
 # Page configuration
 # ---------------------------------------------------------------------------
@@ -435,9 +464,144 @@ fig_heat.update_layout(
 st.plotly_chart(fig_heat, use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# Section 8: Data Import
+# Section 8: Data Import & Market Data
 # ---------------------------------------------------------------------------
 st.header("Data Import & Historical Volatility")
+
+# --- Alpaca live market data ---
+st.subheader("Alpaca Market Data")
+
+if MARKET_DATA_AVAILABLE:
+  md_col1, md_col2, md_col3 = st.columns(3)
+  with md_col1:
+    ticker = st.text_input("Ticker Symbol", value="AAPL", key="alpaca_ticker")
+  with md_col2:
+    hist_days = st.number_input("History (days)", min_value=30, max_value=3650, value=252, key="hist_days")
+  with md_col3:
+    risk_free_for_md = st.number_input(
+      "Risk-Free Rate (for BS bridge)",
+      min_value=0.0,
+      max_value=0.20,
+      value=float(risk_free_rate),
+      step=0.001,
+      format="%.4f",
+      key="md_risk_free",
+    )
+
+  fetch_hist = st.button("Fetch Historical Prices", key="fetch_hist")
+  fetch_spot = st.button("Fetch Current Price", key="fetch_spot")
+  fetch_chain = st.button("Fetch Options Chain", key="fetch_chain")
+
+  if fetch_hist or fetch_spot or fetch_chain:
+    try:
+      md_client = AlpacaMarketData.from_env()
+      symbol = md_client.validate_symbol(ticker)
+
+      if fetch_hist:
+        start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(hist_days))
+        hist_df = md_client.get_historical_prices(symbol, start=start)
+        st.session_state["alpaca_hist"] = hist_df
+        st.session_state["alpaca_symbol"] = symbol
+        closes = md_client.get_close_series(hist_df)
+        vol_stats = VolatilityCalculator.historical_volatility(closes)
+        st.session_state["suggested_vol"] = vol_stats.annualized_volatility
+        st.success(
+          f"Loaded {len(hist_df)} bars for {symbol}. "
+          f"Annualized vol: {vol_stats.annualized_volatility:.2%}"
+        )
+
+      if fetch_spot:
+        live_spot = md_client.get_current_price(symbol)
+        st.session_state["suggested_spot"] = live_spot
+        st.success(f"{symbol} current price: ${live_spot:.2f}")
+
+      if fetch_chain:
+        chain_df = md_client.get_options_chain(symbol)
+        st.session_state["alpaca_chain"] = chain_df
+        st.success(f"Loaded {len(chain_df)} option contracts for {symbol}")
+
+    except AuthenticationError:
+      st.error(
+        "Alpaca credentials not configured. Copy `.env.example` to `.env` "
+        "and set ALPACA_API_KEY and ALPACA_SECRET_KEY."
+      )
+    except MarketDataError as exc:
+      st.error(f"Market data error: {exc}")
+
+  if "alpaca_hist" in st.session_state:
+    hist_df = st.session_state["alpaca_hist"]
+    fig_alpaca = go.Figure()
+    fig_alpaca.add_trace(
+      go.Scatter(x=hist_df.index, y=hist_df["close"], name="Close", line=dict(color="#2563eb"))
+    )
+    fig_alpaca.update_layout(
+      template=CHART_TEMPLATE,
+      title=f"{st.session_state.get('alpaca_symbol', ticker)} Price History (Alpaca)",
+      xaxis_title="Date",
+      yaxis_title="Close ($)",
+      height=350,
+    )
+    st.plotly_chart(fig_alpaca, use_container_width=True)
+
+  if "alpaca_chain" in st.session_state:
+    chain_df = st.session_state["alpaca_chain"]
+    st.dataframe(
+      chain_df.head(50).style.format({
+        "strike": "{:.2f}",
+        "bid": "{:.2f}",
+        "ask": "{:.2f}",
+        "mid": "{:.2f}",
+        "implied_volatility": "{:.2%}",
+      }),
+      use_container_width=True,
+      hide_index=True,
+    )
+
+    contract_idx = st.selectbox(
+      "Select contract for Black-Scholes pricing",
+      range(min(len(chain_df), 50)),
+      format_func=lambda i: (
+        f"{chain_df.iloc[i]['symbol']} | K={chain_df.iloc[i]['strike']:.2f} | "
+        f"{chain_df.iloc[i]['option_type'].upper()} | mid=${chain_df.iloc[i]['mid']:.2f}"
+      ),
+      key="contract_select",
+    )
+
+    if st.button("Price Selected Contract with Black-Scholes", key="price_contract"):
+      try:
+        md_client = AlpacaMarketData.from_env()
+        bs_inputs = md_client.prepare_black_scholes_inputs(
+          ticker,
+          chain_df.iloc[contract_idx],
+          risk_free_rate=risk_free_for_md,
+        )
+        p = bs_inputs["option_params"]
+        opt_t = bs_inputs["option_type"]
+        model_price = BlackScholesModel.price(
+          p.spot, p.strike, p.time_to_expiry, p.risk_free_rate, p.volatility, opt_t, p.dividend_yield
+        )
+        mkt = bs_inputs["market_price"]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Model Price (BS)", f"${model_price:.4f}")
+        c2.metric("Market Mid", f"${mkt:.4f}")
+        c3.metric("Spot", f"${p.spot:.2f}")
+        c4.metric("Hist. Vol", f"{bs_inputs['historical_volatility']:.2%}" if bs_inputs["historical_volatility"] else "N/A")
+
+        st.json({
+          "strike": p.strike,
+          "time_to_expiry_years": round(p.time_to_expiry, 4),
+          "volatility": round(p.volatility, 4),
+          "risk_free_rate": p.risk_free_rate,
+          "contract": bs_inputs["contract_symbol"],
+        })
+      except MarketDataError as exc:
+        st.error(f"Pricing error: {exc}")
+else:
+  st.warning("Market data module not available. Install alpaca-py: pip install alpaca-py")
+
+st.divider()
+st.subheader("CSV Upload")
 
 uploaded_file = st.file_uploader("Upload CSV (Date, Close columns)", type=["csv"])
 
@@ -491,6 +655,195 @@ else:
   sample_path = PROJECT_ROOT / "data" / "sample_prices.csv"
   if sample_path.exists():
     st.caption(f"Sample data available at: `{sample_path}`")
+
+# ---------------------------------------------------------------------------
+# Section 9: ML Return Prediction (XGBoost)
+# ---------------------------------------------------------------------------
+st.header("ML Return Prediction (XGBoost)")
+st.caption(
+  "Predict next-day log returns using technical features. "
+  "Chronological train/test split and walk-forward backtest — no look-ahead bias."
+)
+
+if not ML_AVAILABLE:
+  st.warning(
+    f"ML module unavailable. {ML_IMPORT_ERROR or 'Install dependencies:'}  \n"
+    "```bash\npip install xgboost scikit-learn joblib\nbrew install libomp  # macOS only\n```"
+  )
+else:
+  # Clean up legacy session key that collided with button widget state
+  if "ml_backtest" in st.session_state and isinstance(st.session_state["ml_backtest"], bool):
+    del st.session_state["ml_backtest"]
+
+  ml_c1, ml_c2, ml_c3 = st.columns(3)
+  with ml_c1:
+    ml_ticker = st.text_input("ML Ticker", value=st.session_state.get("alpaca_symbol", "AAPL"), key="ml_ticker")
+  with ml_c2:
+    ml_hist_days = st.number_input("Training history (days)", 180, 3650, 504, key="ml_hist_days")
+  with ml_c3:
+    ml_test_pct = st.slider("Test set (%)", 10, 40, 20, key="ml_test_pct")
+
+  with st.expander("Model hyperparameters"):
+    hp1, hp2, hp3 = st.columns(3)
+    with hp1:
+      ml_estimators = st.number_input("Trees", 50, 1000, 300, step=50, key="ml_estimators")
+      ml_depth = st.number_input("Max depth", 2, 10, 4, key="ml_depth")
+    with hp2:
+      ml_lr = st.number_input("Learning rate", 0.01, 0.3, 0.05, step=0.01, key="ml_lr")
+      ml_cv_splits = st.number_input("CV folds", 3, 10, 5, key="ml_cv_splits")
+    with hp3:
+      ml_bt_step = st.number_input("Backtest step (days)", 5, 63, 21, key="ml_bt_step")
+      ml_min_train = st.number_input("Min train rows", 60, 500, 120, key="ml_min_train")
+
+  ml_config = XGBoostConfig(
+    n_estimators=int(ml_estimators),
+    max_depth=int(ml_depth),
+    learning_rate=float(ml_lr),
+    n_cv_splits=int(ml_cv_splits),
+    test_size=float(ml_test_pct) / 100.0,
+  )
+
+  train_col, backtest_col, predict_col = st.columns(3)
+  train_clicked = train_col.button("Train Model", type="primary", key="ml_train_btn")
+  backtest_clicked = backtest_col.button("Run Walk-Forward Backtest", key="ml_backtest_btn")
+  predict_clicked = predict_col.button("Generate Predictions", key="ml_predict_btn")
+
+  def _load_ohlcv_for_ml(ticker_sym: str, days: int) -> pd.DataFrame:
+    """Use cached Alpaca history or fetch fresh OHLCV."""
+    if (
+      "alpaca_hist" in st.session_state
+      and st.session_state.get("alpaca_symbol", "").upper() == ticker_sym.upper()
+      and len(st.session_state["alpaca_hist"]) >= 100
+    ):
+      return st.session_state["alpaca_hist"]
+    if not MARKET_DATA_AVAILABLE:
+      raise RuntimeError("Alpaca market data required. Configure API keys in .env")
+    client = AlpacaMarketData.from_env()
+    start = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+    return client.get_historical_prices(client.validate_symbol(ticker_sym), start=start)
+
+  if train_clicked:
+    with st.spinner(f"Training XGBoost on {ml_ticker}..."):
+      try:
+        ohlcv_ml = _load_ohlcv_for_ml(ml_ticker, int(ml_hist_days))
+        predictor = ReturnPredictor(config=ml_config, model_dir=PROJECT_ROOT / "models")
+        result = predictor.train(ohlcv_ml, save=True, model_name=ml_ticker.upper())
+        st.session_state["ml_result"] = result
+        st.session_state["ml_predictor_path"] = str(result.model_path)
+        st.session_state["ml_ohlcv"] = ohlcv_ml
+        st.session_state["ml_ticker_saved"] = ml_ticker.upper()
+        st.success(f"Model trained and saved to `{result.model_path.name}`")
+      except Exception as exc:
+        st.error(f"Training failed: {exc}")
+
+  if backtest_clicked:
+    with st.spinner("Running walk-forward backtest..."):
+      try:
+        ohlcv_ml = _load_ohlcv_for_ml(ml_ticker, int(ml_hist_days))
+        bt = WalkForwardBacktester(
+          config=ml_config,
+          min_train_rows=int(ml_min_train),
+          test_step=int(ml_bt_step),
+        )
+        bt_result = bt.run(ohlcv_ml, retrain_each_window=True)
+        st.session_state["ml_backtest_result"] = bt_result
+        st.success("Backtest complete.")
+      except Exception as exc:
+        st.error(f"Backtest failed: {exc}")
+
+  if predict_clicked and "ml_predictor_path" in st.session_state:
+    try:
+      if "ml_ohlcv" in st.session_state and len(st.session_state["ml_ohlcv"]) > 0:
+        ohlcv_ml = st.session_state["ml_ohlcv"]
+      else:
+        ohlcv_ml = _load_ohlcv_for_ml(ml_ticker, int(ml_hist_days))
+      predictor = ReturnPredictor(config=ml_config, model_dir=PROJECT_ROOT / "models")
+      predictor.load(st.session_state["ml_predictor_path"])
+      preds = predictor.predict(ohlcv_ml)
+      st.session_state["ml_predictions"] = preds
+    except Exception as exc:
+      st.error(f"Prediction failed: {exc}")
+
+  if "ml_result" in st.session_state:
+    result = st.session_state["ml_result"]
+    st.subheader("Training Results")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("RMSE", f"{result.metrics.rmse:.6f}")
+    m2.metric("MAE", f"{result.metrics.mae:.6f}")
+    m3.metric("Directional Accuracy", f"{result.metrics.directional_accuracy:.1%}")
+    m4.metric("Test samples", result.metrics.n_samples)
+
+    st.caption(f"Train size: {result.train_size} | Test size: {result.test_size}")
+
+    # CV summary
+    cv_rmse = np.mean([m.rmse for m in result.cv_metrics])
+    cv_dir = np.mean([m.directional_accuracy for m in result.cv_metrics])
+    st.info(f"Cross-validation avg RMSE: {cv_rmse:.6f} | avg directional accuracy: {cv_dir:.1%}")
+
+    # Feature importance chart
+    imp = result.feature_importance.head(15)
+    fig_imp = go.Figure(
+      go.Bar(
+        x=imp["importance"],
+        y=imp["feature"],
+        orientation="h",
+        marker_color="#7c3aed",
+      )
+    )
+    fig_imp.update_layout(
+      template=CHART_TEMPLATE,
+      title="Feature Importance (Top 15)",
+      xaxis_title="Importance (gain)",
+      height=450,
+      yaxis=dict(autorange="reversed"),
+    )
+    st.plotly_chart(fig_imp, use_container_width=True)
+
+  if "ml_backtest_result" in st.session_state:
+    bt_result = st.session_state["ml_backtest_result"]
+    if not hasattr(bt_result, "metrics"):
+      st.warning("Backtest data invalid — click **Run Walk-Forward Backtest** again.")
+    else:
+      st.subheader("Walk-Forward Backtest")
+
+      b1, b2, b3, b4 = st.columns(4)
+      b1.metric("RMSE", f"{bt_result.metrics.rmse:.6f}")
+      b2.metric("Directional Accuracy", f"{bt_result.metrics.directional_accuracy:.1%}")
+      b3.metric("Strategy Return", f"{bt_result.cumulative_strategy_return:.2%}")
+      b4.metric("Buy & Hold Return", f"{bt_result.cumulative_buy_hold_return:.2%}")
+
+      pred_df = bt_result.predictions
+      fig_bt = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=("Predicted vs Actual Returns", "Cumulative Strategy vs Buy & Hold"),
+        vertical_spacing=0.12,
+      )
+      fig_bt.add_trace(
+        go.Scatter(x=pred_df.index, y=pred_df["actual_return"], name="Actual", line=dict(color="#2563eb")),
+        row=1, col=1,
+      )
+      fig_bt.add_trace(
+        go.Scatter(x=pred_df.index, y=pred_df["predicted_return"], name="Predicted", line=dict(color="#ea580c")),
+        row=1, col=1,
+      )
+      positions = (pred_df["predicted_return"] > 0).astype(float)
+      strat_cum = (1 + positions * pred_df["actual_return"]).cumprod() - 1
+      bh_cum = (1 + pred_df["actual_return"]).cumprod() - 1
+      fig_bt.add_trace(go.Scatter(x=pred_df.index, y=strat_cum, name="Long/Flat Strategy"), row=2, col=1)
+      fig_bt.add_trace(go.Scatter(x=pred_df.index, y=bh_cum, name="Buy & Hold"), row=2, col=1)
+      fig_bt.update_layout(template=CHART_TEMPLATE, height=550, legend=dict(orientation="h", y=1.06))
+      st.plotly_chart(fig_bt, use_container_width=True)
+
+  if "ml_predictions" in st.session_state:
+    preds = st.session_state["ml_predictions"]
+    st.subheader("Latest Return Predictions")
+    st.dataframe(
+      preds.tail(20).to_frame("predicted_log_return").style.format("{:.6f}"),
+      use_container_width=True,
+    )
+    direction = "UP" if preds.iloc[-1] > 0 else "DOWN"
+    st.metric("Latest signal", direction, f"{preds.iloc[-1]:.4%} predicted log return")
 
 # Footer
 st.divider()
